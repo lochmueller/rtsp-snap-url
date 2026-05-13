@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -27,6 +28,8 @@ type Stream struct {
 	URL       string `yaml:"url"`
 	TTL       int    `yaml:"ttl"`
 	Transport string `yaml:"transport"`
+	Archive   int    `yaml:"archive"`  // 0=none, -1=unlimited, N=keep last N
+	Interval  int    `yaml:"interval"` // seconds between auto-snapshots, 0=disabled
 }
 
 type Config struct {
@@ -90,8 +93,8 @@ func lockFor(key string) *sync.Mutex {
 	return m.(*sync.Mutex)
 }
 
-func fresh(path string, ttl time.Duration) bool {
-	info, err := os.Stat(path)
+func fresh(p string, ttl time.Duration) bool {
+	info, err := os.Stat(p)
 	if err != nil {
 		return false
 	}
@@ -120,6 +123,139 @@ func grab(ctx context.Context, url, transport, dest string) error {
 		return errors.New("ffmpeg produced no output")
 	}
 	return nil
+}
+
+func resolveTransport(stream Stream, cfg Config) string {
+	if stream.Transport != "" {
+		return stream.Transport
+	}
+	if cfg.DefaultTransport != "" {
+		return cfg.DefaultTransport
+	}
+	return "tcp"
+}
+
+func resolveTTL(stream Stream, cfg Config) time.Duration {
+	ttlSec := stream.TTL
+	if ttlSec <= 0 {
+		ttlSec = cfg.DefaultTTL
+	}
+	if ttlSec <= 0 {
+		ttlSec = 30
+	}
+	return time.Duration(ttlSec) * time.Second
+}
+
+// refreshSnapshot grabs a fresh frame, archives the previous cache entry
+// (if archive is enabled), then atomically replaces the cache file. The
+// caller is responsible for holding lockFor(key).
+func refreshSnapshot(key string, stream Stream, cfg Config) error {
+	cachePath := filepath.Join(cacheDir, key+".jpg")
+	tmpPath := cachePath + ".tmp"
+
+	ctx, cancel := context.WithTimeout(context.Background(), ffTimeout)
+	defer cancel()
+	if err := grab(ctx, stream.URL, resolveTransport(stream, cfg), tmpPath); err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return context.DeadlineExceeded
+		}
+		return err
+	}
+	archiveOld(key, cachePath, stream.Archive)
+	return os.Rename(tmpPath, cachePath)
+}
+
+func archiveOld(key, cachePath string, keep int) {
+	if keep == 0 {
+		return
+	}
+	info, err := os.Stat(cachePath)
+	if err != nil {
+		return // nothing to archive
+	}
+	dir := filepath.Join(cacheDir, "archive", key)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Printf("archive mkdir %s: %v", key, err)
+		return
+	}
+	ts := info.ModTime().UTC().Format("2006-01-02_15-04-05.000Z")
+	dest := filepath.Join(dir, ts+".jpg")
+	if err := os.Rename(cachePath, dest); err != nil {
+		// cross-filesystem? fall back to copy.
+		if data, readErr := os.ReadFile(cachePath); readErr == nil {
+			if writeErr := os.WriteFile(dest, data, 0o644); writeErr != nil {
+				log.Printf("archive write %s: %v", key, writeErr)
+				return
+			}
+			_ = os.Remove(cachePath)
+		} else {
+			log.Printf("archive move %s: %v", key, err)
+			return
+		}
+	}
+	if keep > 0 {
+		rotateArchive(dir, keep)
+	}
+}
+
+func rotateArchive(dir string, keep int) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	jpgs := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".jpg") {
+			jpgs = append(jpgs, e.Name())
+		}
+	}
+	if len(jpgs) <= keep {
+		return
+	}
+	sort.Strings(jpgs)
+	for _, name := range jpgs[:len(jpgs)-keep] {
+		_ = os.Remove(filepath.Join(dir, name))
+	}
+}
+
+// autoScheduler periodically scans the config and triggers a refresh for
+// any stream whose `interval` has elapsed since its last auto-snapshot.
+func autoScheduler(ctx context.Context) {
+	last := map[string]time.Time{}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cfg, err := loadConfig()
+			if err != nil {
+				continue
+			}
+			now := time.Now()
+			for key, stream := range cfg.Streams {
+				if stream.Interval <= 0 || stream.URL == "" {
+					continue
+				}
+				interval := time.Duration(stream.Interval) * time.Second
+				if now.Sub(last[key]) < interval {
+					continue
+				}
+				last[key] = now
+				k, s, c := key, stream, cfg
+				go func() {
+					mu := lockFor(k)
+					mu.Lock()
+					defer mu.Unlock()
+					if err := refreshSnapshot(k, s, c); err != nil {
+						log.Printf("auto-snapshot %s: %v", k, err)
+					}
+				}()
+			}
+		}
+	}
 }
 
 func serveImage(w http.ResponseWriter, r *http.Request, p string, ttl time.Duration) {
@@ -163,23 +299,7 @@ func snapshotHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ttlSec := stream.TTL
-	if ttlSec <= 0 {
-		ttlSec = cfg.DefaultTTL
-	}
-	if ttlSec <= 0 {
-		ttlSec = 30
-	}
-	ttl := time.Duration(ttlSec) * time.Second
-
-	transport := stream.Transport
-	if transport == "" {
-		transport = cfg.DefaultTransport
-	}
-	if transport == "" {
-		transport = "tcp"
-	}
-
+	ttl := resolveTTL(stream, cfg)
 	cachePath := filepath.Join(cacheDir, key+".jpg")
 	if fresh(cachePath, ttl) {
 		serveImage(w, r, cachePath, ttl)
@@ -189,30 +309,22 @@ func snapshotHandler(w http.ResponseWriter, r *http.Request) {
 	mu := lockFor(key)
 	mu.Lock()
 	defer mu.Unlock()
-
 	if fresh(cachePath, ttl) {
 		serveImage(w, r, cachePath, ttl)
 		return
 	}
 
-	tmpPath := cachePath + ".tmp"
-	ctx, cancel := context.WithTimeout(context.Background(), ffTimeout)
-	defer cancel()
-	if err := grab(ctx, stream.URL, transport, tmpPath); err != nil {
+	if err := refreshSnapshot(key, stream, cfg); err != nil {
 		log.Printf("grab failed for %s: %v", key, err)
 		if _, statErr := os.Stat(cachePath); statErr == nil {
 			serveImage(w, r, cachePath, ttl)
 			return
 		}
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		if errors.Is(err, context.DeadlineExceeded) {
 			http.Error(w, "ffmpeg timed out", http.StatusGatewayTimeout)
 			return
 		}
 		http.Error(w, "ffmpeg failed", http.StatusBadGateway)
-		return
-	}
-	if err := os.Rename(tmpPath, cachePath); err != nil {
-		http.Error(w, "rename failed", http.StatusInternalServerError)
 		return
 	}
 	serveImage(w, r, cachePath, ttl)
@@ -349,6 +461,8 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
+
+	go autoScheduler(ctx)
 
 	serverErr := make(chan error, 1)
 	go func() {

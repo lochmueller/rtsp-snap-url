@@ -4,3 +4,4 @@ rtsp-snap
 .DS_Store
 *.swp
 vendor/
+.idea/

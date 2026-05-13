@@ -17,3 +17,12 @@ streams:
     url: rtsp://192.168.1.12/h264
     ttl: 120
     transport: udp
+
+  driveway:
+    url: rtsp://192.168.1.13/h264
+    # Auto-snapshot every 60 seconds, independent of HTTP traffic.
+    interval: 60
+    # Keep the last 100 archived snapshots under
+    # /var/cache/rtsp-snap/archive/driveway/<timestamp>.jpg.
+    # 0 = no archive (default), -1 = unlimited, N = keep last N.
+    archive: 100

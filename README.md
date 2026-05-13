@@ -33,12 +33,28 @@ streams:
     url: rtsp://192.168.1.12/h264
     ttl: 120
     transport: udp
+  driveway:
+    url: rtsp://192.168.1.13/h264
+    interval: 60
+    archive: 100
 ```
+
+Per-stream fields:
+
+| Field       | Default | Meaning                                                                                                       |
+| ----------- | ------- | ------------------------------------------------------------------------------------------------------------- |
+| `url`       | —       | RTSP source URL (required).                                                                                   |
+| `ttl`       | `30`    | Cache validity in seconds. Repeated requests inside the window return the cached frame.                       |
+| `transport` | `tcp`   | RTSP transport: `tcp` (more reliable) or `udp`.                                                               |
+| `interval`  | `0`     | Auto-snapshot interval in seconds. The scheduler refreshes the cache every `interval` seconds, even without HTTP traffic. `0` disables. |
+| `archive`   | `0`     | How many previous snapshots to keep. `0` = no archive, `-1` = unlimited, `N` = keep the last `N`.             |
 
 - The key (e.g. `front_door`) becomes the URL path: `/front_door.jpg`.
 - Keys must match `[A-Za-z0-9_-]+`.
-- `ttl` is in seconds. Within that window, repeated requests return the cached frame.
-- `transport` is `tcp` (default, more reliable) or `udp`.
+
+### Archive layout
+
+Archived snapshots are written to `{RTSP_CACHE_DIR}/archive/<key>/<UTC-timestamp>.jpg` (timestamp format `2006-01-02_15-04-05.000Z`). The timestamp reflects when that frame was originally grabbed. Files are rotated atomically — the previous cache file is moved into the archive, then the fresh capture replaces the cache. Mount the cache directory as a Docker volume if you want the archive to survive container restarts.
 
 ## Run
 
