@@ -1,0 +1,19 @@
+# Default snapshot validity in seconds. Each stream may override this.
+default_ttl: 30
+
+# Default RTSP transport ("tcp" or "udp").
+default_transport: tcp
+
+streams:
+  front_door:
+    url: rtsp://user:pass@192.168.1.10:554/stream1
+    ttl: 30
+
+  backyard:
+    url: rtsp://user:pass@192.168.1.11:554/stream1
+    # ttl omitted -> default_ttl is used
+
+  garage:
+    url: rtsp://192.168.1.12/h264
+    ttl: 120
+    transport: udp

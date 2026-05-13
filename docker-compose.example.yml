@@ -1,0 +1,14 @@
+services:
+  rtsp-snap:
+    build: .
+    # image: rtsp-snap-url:latest
+    container_name: rtsp-snap
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.yaml:/etc/rtsp-snap/config.yaml:ro
+      - rtsp-cache:/var/cache/rtsp-snap
+    restart: unless-stopped
+
+volumes:
+  rtsp-cache:
