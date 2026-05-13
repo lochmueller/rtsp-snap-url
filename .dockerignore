@@ -1,0 +1,12 @@
+.git
+.github
+.gitignore
+.DS_Store
+*.swp
+LICENSE
+README.md
+docker-compose.example.yml
+docker-compose.yml
+config.yaml
+rtsp-snap
+vendor/

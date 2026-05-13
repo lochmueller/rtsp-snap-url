@@ -45,7 +45,7 @@ streams:
 Pre-built images are published to GitHub Container Registry on every push to `main`:
 
 ```bash
-docker pull ghcr.io/<owner>/<repo>:latest
+docker pull ghcr.io/lochmueller/rtsp-snap-url:latest
 ```
 
 Or build locally:
@@ -88,6 +88,18 @@ Every env var also has an equivalent CLI flag.
 | `502 Bad Gateway`     | ffmpeg failed (camera offline, bad URL). Stale frame served if available. |
 | `504 Gateway Timeout` | ffmpeg exceeded `RTSP_FFMPEG_TIMEOUT`.                                    |
 | `500 …`               | Config missing or unreadable.                                             |
+
+## Endpoints
+
+| Path           | Purpose                                                                |
+| -------------- | ---------------------------------------------------------------------- |
+| `/`            | HTML index — grid of configured streams with lazy-loaded thumbnails.   |
+| `/<key>.jpg`   | Snapshot for the given stream key (cached, refreshed per TTL).         |
+| `/healthz`     | Liveness probe — returns `200` if the config is readable, `503` else.  |
+
+## License
+
+[MIT](LICENSE) — see `LICENSE` file.
 
 ## Build without Docker
 

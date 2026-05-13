@@ -5,15 +5,19 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"html"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -118,8 +122,8 @@ func grab(ctx context.Context, url, transport, dest string) error {
 	return nil
 }
 
-func serveImage(w http.ResponseWriter, r *http.Request, path string, ttl time.Duration) {
-	f, err := os.Open(path)
+func serveImage(w http.ResponseWriter, r *http.Request, p string, ttl time.Duration) {
+	f, err := os.Open(p)
 	if err != nil {
 		http.Error(w, "cannot open snapshot", http.StatusBadGateway)
 		return
@@ -132,14 +136,10 @@ func serveImage(w http.ResponseWriter, r *http.Request, path string, ttl time.Du
 	}
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(ttl.Seconds())))
-	http.ServeContent(w, r, filepath.Base(path), info.ModTime(), f)
+	http.ServeContent(w, r, filepath.Base(p), info.ModTime(), f)
 }
 
-func handler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+func snapshotHandler(w http.ResponseWriter, r *http.Request) {
 	m := keyRegex.FindStringSubmatch(path.Base(r.URL.Path))
 	if m == nil {
 		http.NotFound(w, r)
@@ -218,6 +218,90 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	serveImage(w, r, cachePath, ttl)
 }
 
+const indexTmpl = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>rtsp-snap-url</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; background:#111; color:#ddd; margin: 1rem; }
+  h1 { font-weight: 400; font-size: 1.1rem; color:#999; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 1rem; }
+  .card { background:#1c1c1c; border-radius: 6px; padding: 0.4rem; }
+  .card a { color: inherit; text-decoration: none; }
+  .card img { width: 100%%; aspect-ratio: 16/9; object-fit: cover; background:#000; display:block; }
+  .card .name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; padding: 0.4rem 0.2rem 0.1rem; font-size: 0.9rem; }
+  .empty { color:#777; }
+</style>
+</head>
+<body>
+<h1>rtsp-snap-url &mdash; %d stream%s</h1>
+%s
+</body>
+</html>
+`
+
+func indexHandler(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		http.Error(w, "config error", http.StatusInternalServerError)
+		return
+	}
+	keys := make([]string, 0, len(cfg.Streams))
+	for k := range cfg.Streams {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var body string
+	if len(keys) == 0 {
+		body = `<p class="empty">No streams configured.</p>`
+	} else {
+		body = `<div class="grid">`
+		for _, k := range keys {
+			esc := html.EscapeString(k)
+			body += fmt.Sprintf(
+				`<div class="card"><a href="/%s.jpg"><img loading="lazy" src="/%s.jpg" alt="%s"><div class="name">%s</div></a></div>`,
+				esc, esc, esc, esc,
+			)
+		}
+		body += `</div>`
+	}
+
+	plural := "s"
+	if len(keys) == 1 {
+		plural = ""
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, indexTmpl, len(keys), plural, body)
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	if _, err := loadConfig(); err != nil {
+		http.Error(w, "config error", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte("ok\n"))
+}
+
+func rootHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if r.URL.Path == "/" {
+		indexHandler(w, r)
+		return
+	}
+	snapshotHandler(w, r)
+}
+
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
@@ -253,13 +337,39 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", handler)
+	mux.HandleFunc("/healthz", healthHandler)
+	mux.HandleFunc("/", rootHandler)
+
 	addr := fmt.Sprintf("%s:%d", bind, port)
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	log.Printf("Listening on %s", addr)
-	log.Fatal(srv.ListenAndServe())
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Printf("Listening on %s", addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+		}
+		close(serverErr)
+	}()
+
+	select {
+	case err := <-serverErr:
+		if err != nil {
+			log.Fatalf("server: %v", err)
+		}
+	case <-ctx.Done():
+		log.Println("Shutdown signal received, draining...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("shutdown: %v", err)
+		}
+	}
 }
