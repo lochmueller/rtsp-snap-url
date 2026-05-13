@@ -42,13 +42,15 @@ var (
 	configPath string
 	cacheDir   string
 	ffTimeout  time.Duration
+	ffmpegPath string
 
 	configMu    sync.RWMutex
 	configData  Config
 	configMtime time.Time
 
-	keyLocks sync.Map
-	keyRegex = regexp.MustCompile(`^([A-Za-z0-9_-]+)\.jpg$`)
+	keyLocks         sync.Map
+	keyRegex         = regexp.MustCompile(`^([A-Za-z0-9_-]+)\.jpg$`)
+	archivePathRegex = regexp.MustCompile(`^/archive/([A-Za-z0-9_-]+)(?:/([0-9A-Za-z._-]+\.jpg))?/?$`)
 )
 
 func loadConfig() (Config, error) {
@@ -102,8 +104,13 @@ func fresh(p string, ttl time.Duration) bool {
 }
 
 func grab(ctx context.Context, url, transport, dest string) error {
-	cmd := exec.CommandContext(ctx, "ffmpeg", "-y",
+	// -timeout (RTSP demuxer, microseconds) makes ffmpeg bail cleanly on
+	// stalled RTSP sockets rather than waiting for the parent context to
+	// kill it. Replaces the deprecated -stimeout flag.
+	timeoutUs := strconv.FormatInt(ffTimeout.Microseconds(), 10)
+	cmd := exec.CommandContext(ctx, ffmpegPath, "-y",
 		"-rtsp_transport", transport,
+		"-timeout", timeoutUs,
 		"-i", url,
 		"-frames:v", "1",
 		"-q:v", "2",
@@ -301,7 +308,8 @@ func snapshotHandler(w http.ResponseWriter, r *http.Request) {
 
 	ttl := resolveTTL(stream, cfg)
 	cachePath := filepath.Join(cacheDir, key+".jpg")
-	if fresh(cachePath, ttl) {
+	force := r.URL.Query().Get("refresh") == "1"
+	if !force && fresh(cachePath, ttl) {
 		serveImage(w, r, cachePath, ttl)
 		return
 	}
@@ -309,7 +317,7 @@ func snapshotHandler(w http.ResponseWriter, r *http.Request) {
 	mu := lockFor(key)
 	mu.Lock()
 	defer mu.Unlock()
-	if fresh(cachePath, ttl) {
+	if !force && fresh(cachePath, ttl) {
 		serveImage(w, r, cachePath, ttl)
 		return
 	}
@@ -335,20 +343,25 @@ const indexTmpl = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <title>rtsp-snap-url</title>
+<meta http-equiv="refresh" content="5; url=/">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
   body { font-family: -apple-system, system-ui, sans-serif; background:#111; color:#ddd; margin: 1rem; }
   h1 { font-weight: 400; font-size: 1.1rem; color:#999; }
+  .toolbar { margin: 0.4rem 0 1rem; font-size: 0.85rem; }
+  .toolbar a { color: #6cf; text-decoration: none; margin-right: 1rem; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 1rem; }
   .card { background:#1c1c1c; border-radius: 6px; padding: 0.4rem; }
   .card a { color: inherit; text-decoration: none; }
   .card img { width: 100%%; aspect-ratio: 16/9; object-fit: cover; background:#000; display:block; }
-  .card .name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; padding: 0.4rem 0.2rem 0.1rem; font-size: 0.9rem; }
+  .card .name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; padding: 0.4rem 0.2rem 0.1rem; font-size: 0.9rem; display:flex; justify-content:space-between; align-items:center; gap: 0.5rem; }
+  .card .name a.archive { color:#6cf; font-size: 0.75rem; }
   .empty { color:#777; }
 </style>
 </head>
 <body>
 <h1>rtsp-snap-url &mdash; %d stream%s</h1>
+<div class="toolbar"><a href="/?refresh=1">Refresh all</a></div>
 %s
 </body>
 </html>
@@ -370,6 +383,12 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Strings(keys)
 
+	force := r.URL.Query().Get("refresh") == "1"
+	imgQS := ""
+	if force {
+		imgQS = "?refresh=1"
+	}
+
 	var body string
 	if len(keys) == 0 {
 		body = `<p class="empty">No streams configured.</p>`
@@ -377,9 +396,13 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 		body = `<div class="grid">`
 		for _, k := range keys {
 			esc := html.EscapeString(k)
+			archiveLink := ""
+			if cfg.Streams[k].Archive != 0 {
+				archiveLink = fmt.Sprintf(`<a class="archive" href="/archive/%s">archive</a>`, esc)
+			}
 			body += fmt.Sprintf(
-				`<div class="card"><a href="/%s.jpg"><img loading="lazy" src="/%s.jpg" alt="%s"><div class="name">%s</div></a></div>`,
-				esc, esc, esc, esc,
+				`<div class="card"><a href="/%s.jpg%s"><img loading="lazy" src="/%s.jpg%s" alt="%s"></a><div class="name"><span>%s</span>%s</div></div>`,
+				esc, imgQS, esc, imgQS, esc, esc, archiveLink,
 			)
 		}
 		body += `</div>`
@@ -393,11 +416,140 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, indexTmpl, len(keys), plural, body)
 }
 
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	if _, err := loadConfig(); err != nil {
-		http.Error(w, "config error", http.StatusServiceUnavailable)
+const archiveIndexTmpl = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Archive: %s</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; background:#111; color:#ddd; margin: 1rem; }
+  h1 { font-weight: 400; font-size: 1.1rem; color:#999; }
+  .back { font-size: 0.85rem; margin-bottom: 1rem; }
+  .back a { color: #6cf; text-decoration: none; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 0.8rem; }
+  .card { background:#1c1c1c; border-radius: 6px; padding: 0.3rem; }
+  .card a { color: inherit; text-decoration: none; }
+  .card img { width: 100%%; aspect-ratio: 16/9; object-fit: cover; background:#000; display:block; }
+  .card .ts { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; padding: 0.3rem 0.2rem 0.1rem; font-size: 0.75rem; color: #aaa; }
+  .empty { color:#777; }
+</style>
+</head>
+<body>
+<div class="back"><a href="/">&larr; back</a></div>
+<h1>archive &mdash; %s (%d snapshot%s)</h1>
+%s
+</body>
+</html>
+`
+
+func archiveHandler(w http.ResponseWriter, r *http.Request) {
+	m := archivePathRegex.FindStringSubmatch(r.URL.Path)
+	if m == nil {
+		http.NotFound(w, r)
 		return
 	}
+	key, file := m[1], m[2]
+
+	cfg, err := loadConfig()
+	if err != nil {
+		http.Error(w, "config error", http.StatusInternalServerError)
+		return
+	}
+	stream, ok := cfg.Streams[key]
+	if !ok || stream.Archive == 0 {
+		http.NotFound(w, r)
+		return
+	}
+
+	archiveDir := filepath.Join(cacheDir, "archive", key)
+
+	if file == "" {
+		renderArchiveIndex(w, key, archiveDir)
+		return
+	}
+
+	// defense-in-depth against path traversal: filepath.Base must equal file
+	if filepath.Base(file) != file {
+		http.NotFound(w, r)
+		return
+	}
+	full := filepath.Join(archiveDir, file)
+	f, err := os.Open(full)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || info.IsDir() {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cache-Control", "public, max-age=86400, immutable")
+	http.ServeContent(w, r, file, info.ModTime(), f)
+}
+
+func renderArchiveIndex(w http.ResponseWriter, key, dir string) {
+	entries, _ := os.ReadDir(dir)
+	type item struct {
+		Name string
+		TS   time.Time
+	}
+	items := make([]item, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jpg") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		items = append(items, item{Name: e.Name(), TS: info.ModTime()})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].TS.After(items[j].TS) })
+
+	esc := html.EscapeString(key)
+	var body string
+	if len(items) == 0 {
+		body = `<p class="empty">No archived snapshots yet.</p>`
+	} else {
+		body = `<div class="grid">`
+		for _, it := range items {
+			n := html.EscapeString(it.Name)
+			ts := html.EscapeString(it.TS.UTC().Format("2006-01-02 15:04:05 UTC"))
+			body += fmt.Sprintf(
+				`<div class="card"><a href="/archive/%s/%s"><img loading="lazy" src="/archive/%s/%s" alt="%s"><div class="ts">%s</div></a></div>`,
+				esc, n, esc, n, n, ts,
+			)
+		}
+		body += `</div>`
+	}
+
+	plural := "s"
+	if len(items) == 1 {
+		plural = ""
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, archiveIndexTmpl, esc, esc, len(items), plural, body)
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	if _, err := loadConfig(); err != nil {
+		http.Error(w, "config error: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	if _, err := os.Stat(ffmpegPath); err != nil {
+		http.Error(w, "ffmpeg missing: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	probe := filepath.Join(cacheDir, ".healthcheck")
+	if err := os.WriteFile(probe, []byte("ok"), 0o644); err != nil {
+		http.Error(w, "cache dir not writable: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	_ = os.Remove(probe)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = w.Write([]byte("ok\n"))
 }
@@ -447,9 +599,15 @@ func main() {
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		log.Fatalf("cache dir: %v", err)
 	}
+	resolved, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		log.Fatalf("ffmpeg not found in PATH: %v", err)
+	}
+	ffmpegPath = resolved
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthHandler)
+	mux.HandleFunc("/archive/", archiveHandler)
 	mux.HandleFunc("/", rootHandler)
 
 	addr := fmt.Sprintf("%s:%d", bind, port)

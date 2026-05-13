@@ -107,11 +107,15 @@ Every env var also has an equivalent CLI flag.
 
 ## Endpoints
 
-| Path           | Purpose                                                                |
-| -------------- | ---------------------------------------------------------------------- |
-| `/`            | HTML index — grid of configured streams with lazy-loaded thumbnails.   |
-| `/<key>.jpg`   | Snapshot for the given stream key (cached, refreshed per TTL).         |
-| `/healthz`     | Liveness probe — returns `200` if the config is readable, `503` else.  |
+| Path                     | Purpose                                                                                  |
+| ------------------------ | ---------------------------------------------------------------------------------------- |
+| `/`                      | HTML index — grid of configured streams with lazy-loaded thumbnails. Auto-refreshes every 5 s. |
+| `/<key>.jpg`             | Snapshot for the given stream key (cached, refreshed per TTL).                           |
+| `/<key>.jpg?refresh=1`   | Same, but bypasses the TTL once and forces a fresh grab.                                 |
+| `/?refresh=1`            | Dashboard variant that propagates `?refresh=1` to every thumbnail. The 5 s auto-refresh always returns to `/` without the parameter, so it never re-triggers a force refresh. |
+| `/archive/<key>`         | HTML index of archived snapshots (only available when `archive != 0` for that key).      |
+| `/archive/<key>/<file>`  | Serve a single archived snapshot (`Cache-Control: immutable`).                           |
+| `/healthz`               | Liveness probe — `200` if config is readable, `ffmpeg` is present, and cache dir is writable; `503` else. |
 
 ## License
 
